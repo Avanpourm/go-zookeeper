@@ -3,8 +3,10 @@ package zk
 import (
 	"errors"
 	"fmt"
+	"net"
 	"strconv"
 	"strings"
+	"time"
 )
 
 var (
@@ -13,6 +15,7 @@ var (
 )
 
 type Lock struct {
+	name     string
 	c        *Conn
 	path     string
 	acl      []ACL
@@ -21,10 +24,20 @@ type Lock struct {
 }
 
 func NewLock(c *Conn, path string, acl []ACL) *Lock {
+	info, _ := net.InterfaceAddrs()
+	ip := ""
+	for _, addr := range info {
+		ip = strings.Split(addr.String(), "/")[0]
+		if ip != "127.0.0.1" {
+			break
+		}
+	}
 	return &Lock{
 		c:    c,
 		path: path,
 		acl:  acl,
+		name: ip,
+		//			Ev:   make(<-chan bool),
 	}
 }
 
@@ -43,7 +56,7 @@ func (l *Lock) Lock() error {
 	path := ""
 	var err error
 	for i := 0; i < 3; i++ {
-		path, err = l.c.CreateProtectedEphemeralSequential(prefix, []byte{}, l.acl)
+		path, err = l.c.CreateProtectedEphemeralSequential(prefix, []byte(l.name), l.acl)
 		if err == ErrNoNode {
 			// Create parent node.
 			parts := strings.Split(l.path, "/")
@@ -112,12 +125,51 @@ func (l *Lock) Lock() error {
 			return ev.Err
 		}
 	}
-
 	l.seq = seq
 	l.lockPath = path
 	return nil
 }
+func (l *Lock) LockWC(c <-chan bool) (watch <-chan bool, err error) {
+	watch, err = l.LockW()
+	if err != nil {
+		return
+	}
+	go func() {
+		<-c
+		l.Unlock()
+	}()
+	return
+}
+func (l *Lock) LockW() (watch <-chan bool, err error) {
+	err = l.Lock()
+	if err != nil {
+		return
+	}
+	chev := make(chan bool)
+	watch = chev
+	var ok bool
+	go func() {
+		for {
 
+			if l.c.State() != StateHasSession {
+				chev <- false
+				time.Sleep(time.Millisecond * 200)
+				l.Unlock()
+				break
+
+			} else if ok, _, err = l.c.Exists(l.lockPath); err != nil || !ok {
+				chev <- false
+				time.Sleep(time.Millisecond * 200)
+				l.Unlock()
+				break
+
+			}
+			time.Sleep(time.Millisecond * 500)
+		}
+
+	}()
+	return
+}
 func (l *Lock) Unlock() error {
 	if l.lockPath == "" {
 		return ErrNotLocked
@@ -125,7 +177,7 @@ func (l *Lock) Unlock() error {
 	if err := l.c.Delete(l.lockPath, -1); err != nil {
 		return err
 	}
-	l.lockPath = ""
+	//	l.lockPath = ""
 	l.seq = 0
 	return nil
 }

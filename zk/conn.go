@@ -11,6 +11,7 @@ Possible watcher events:
 import (
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -21,6 +22,8 @@ import (
 	"sync/atomic"
 	"time"
 )
+
+var ErrNoServer = errors.New("zk: could not connect to a server")
 
 const (
 	bufferSize      = 1536 * 1024
@@ -104,6 +107,10 @@ type Event struct {
 func Connect(servers []string, recvTimeout time.Duration) (*Conn, <-chan Event, error) {
 	return ConnectWithDialer(servers, recvTimeout, nil)
 }
+func (c *Conn) SessionTimeout(sessionTimeout int32) error {
+	c.timeout = sessionTimeout
+	return nil
+}
 
 func ConnectWithDialer(servers []string, recvTimeout time.Duration, dialer Dialer) (*Conn, <-chan Event, error) {
 	for i, addr := range servers {
@@ -168,6 +175,7 @@ func (c *Conn) setState(state State) {
 func (c *Conn) connect() {
 	c.serverIndex = (c.serverIndex + 1) % len(c.servers)
 	startIndex := c.serverIndex
+	//log.Printf("start connect to %+vth server %s\n", c.serverIndex, c.servers[c.serverIndex])
 	c.setState(StateConnecting)
 	for {
 		zkConn, err := c.dialer("tcp", c.servers[c.serverIndex], c.connectTimeout)
@@ -177,10 +185,11 @@ func (c *Conn) connect() {
 			return
 		}
 
-		log.Printf("Failed to connect to %s: %+v", c.servers[c.serverIndex], err)
+		log.Printf("Failed to connect to %vth server %s: %+v,", c.serverIndex, c.servers[c.serverIndex], err)
 
 		c.serverIndex = (c.serverIndex + 1) % len(c.servers)
 		if c.serverIndex == startIndex {
+			c.flushUnsentRequests(ErrNoServer)
 			time.Sleep(time.Second)
 		}
 	}
@@ -189,11 +198,14 @@ func (c *Conn) connect() {
 func (c *Conn) loop() {
 	for {
 		c.connect()
+
 		err := c.authenticate()
+		log.Printf("after authenticate:%+v,c.State:%+v", err, c.State())
 		switch {
 		case err == ErrSessionExpired:
 			c.invalidateWatches(err)
 		case err != nil && c.conn != nil:
+			//log.Printf("c.conn.Close:%+v", err)
 			c.conn.Close()
 		case err == nil:
 			closeChan := make(chan bool) // channel to tell send loop stop
@@ -201,9 +213,10 @@ func (c *Conn) loop() {
 
 			wg.Add(1)
 			go func() {
-				c.sendLoop(c.conn, closeChan)
+				serr := c.sendLoop(c.conn, closeChan)
 				c.conn.Close() // causes recv loop to EOF/exit
 				wg.Done()
+				fmt.Printf("sendLoop:%v\n", serr)
 			}()
 
 			wg.Add(1)
@@ -214,6 +227,7 @@ func (c *Conn) loop() {
 				}
 				close(closeChan) // tell send loop to exit
 				wg.Done()
+				fmt.Printf("recvLoop:%v\n", err)
 			}()
 
 			wg.Wait()
@@ -223,7 +237,7 @@ func (c *Conn) loop() {
 
 		// Yeesh
 		if err != io.EOF && err != ErrSessionExpired && !strings.Contains(err.Error(), "use of closed network connection") {
-			log.Println(err)
+			log.Printf("zk.conn.loop1:%v\n", err)
 		}
 
 		select {
@@ -234,7 +248,9 @@ func (c *Conn) loop() {
 		}
 
 		if err != ErrSessionExpired {
+			log.Printf("zk.conn.loop2:%v\n", err)
 			err = ErrConnectionClosed
+
 		}
 		c.flushRequests(err)
 
@@ -244,6 +260,18 @@ func (c *Conn) loop() {
 				return
 			case <-time.After(c.reconnectDelay):
 			}
+		}
+	}
+}
+
+func (c *Conn) flushUnsentRequests(err error) {
+	for {
+
+		select {
+		case req := <-c.sendChan:
+			req.recvChan <- response{-1, err}
+		default:
+			return
 		}
 	}
 }
@@ -309,10 +337,11 @@ func (c *Conn) sendSetWatches() {
 	}
 
 	go func() {
+		//time.Sleep(time.Duration(1) * time.Second)
 		res := &setWatchesResponse{}
 		_, err := c.request(opSetWatches, req, res, nil)
 		if err != nil {
-			log.Fatal(err)
+			log.Printf("err:zk.conn.sendSetWatches:%v", err)
 		}
 	}()
 }
@@ -330,6 +359,7 @@ func (c *Conn) authenticate() error {
 		Passwd:          c.passwd,
 	})
 	if err != nil {
+		//log.Printf("authenticate encodePacket:%+v", err)
 		return err
 	}
 
@@ -337,6 +367,7 @@ func (c *Conn) authenticate() error {
 
 	_, err = c.conn.Write(buf[:n+4])
 	if err != nil {
+		//log.Printf("authenticate c.conn.Write:%+v", err)
 		return err
 	}
 
@@ -347,6 +378,7 @@ func (c *Conn) authenticate() error {
 	// package length
 	_, err = io.ReadFull(c.conn, buf[:4])
 	if err != nil {
+		//log.Printf("authenticate io.ReadFull  package length :%+v", err)
 		return err
 	}
 
@@ -356,7 +388,10 @@ func (c *Conn) authenticate() error {
 	}
 
 	_, err = io.ReadFull(c.conn, buf[:blen])
+
 	if err != nil {
+		//log.Printf("authenticate io.ReadFull content :%+v", err)
+
 		return err
 	}
 
@@ -663,6 +698,7 @@ func (c *Conn) CreateProtectedEphemeralSequential(path string, data []byte, acl 
 		case ErrSessionExpired:
 			// No need to search for the node since it can't exist. Just try again.
 		case ErrConnectionClosed:
+			//fmt.Printf("CreateProtectedEphemeralSequential1:%v", err)
 			children, _, err := c.Children(rootPath)
 			if err != nil {
 				return "", err
