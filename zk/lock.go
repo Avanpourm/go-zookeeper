@@ -10,12 +10,15 @@ import (
 )
 
 var (
-	ErrDeadlock  = errors.New("zk: trying to acquire a lock twice")
+	// ErrDeadlock is returned by Lock when trying to lock twice without unlocking first
+	ErrDeadlock = errors.New("zk: trying to acquire a lock twice")
+	// ErrNotLocked is returned by Unlock when trying to release a lock that has not first be acquired.
 	ErrNotLocked = errors.New("zk: not locked")
 )
 
+// Lock is a mutual exclusion lock.
 type Lock struct {
-	name     string
+	name     string // data written to the lock node (local non-loopback IP)
 	c        *Conn
 	path     string
 	acl      []ACL
@@ -23,22 +26,33 @@ type Lock struct {
 	seq      int
 }
 
+// NewLock creates a new lock instance using the provided connection, path, and acl.
+// The path must be a node that is only used by this lock. A lock instances starts
+// unlocked until Lock() is called.
 func NewLock(c *Conn, path string, acl []ACL) *Lock {
-	info, _ := net.InterfaceAddrs()
+	return &Lock{
+		c:    c,
+		path: path,
+		acl:  acl,
+		name: localIP(),
+	}
+}
+
+// localIP returns the first non-loopback interface address, used to identify
+// the lock holder in the lock node data.
+func localIP() string {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return ""
+	}
 	ip := ""
-	for _, addr := range info {
+	for _, addr := range addrs {
 		ip = strings.Split(addr.String(), "/")[0]
 		if ip != "127.0.0.1" {
 			break
 		}
 	}
-	return &Lock{
-		c:    c,
-		path: path,
-		acl:  acl,
-		name: ip,
-		//			Ev:   make(<-chan bool),
-	}
+	return ip
 }
 
 func parseSeq(path string) (int, error) {
@@ -46,6 +60,9 @@ func parseSeq(path string) (int, error) {
 	return strconv.Atoi(parts[len(parts)-1])
 }
 
+// Lock attempts to acquire the lock. It will wait to return until the lock
+// is acquired or an error occurs. If this instance already has the lock
+// then ErrDeadlock is returned.
 func (l *Lock) Lock() error {
 	if l.lockPath != "" {
 		return ErrDeadlock
@@ -62,8 +79,16 @@ func (l *Lock) Lock() error {
 			parts := strings.Split(l.path, "/")
 			pth := ""
 			for _, p := range parts[1:] {
+				var exists bool
 				pth += "/" + p
-				_, err := l.c.Create(pth, []byte{}, 0, l.acl)
+				exists, _, err = l.c.Exists(pth)
+				if err != nil {
+					return err
+				}
+				if exists == true {
+					continue
+				}
+				_, err = l.c.Create(pth, []byte{}, 0, l.acl)
 				if err != nil && err != ErrNodeExists {
 					return err
 				}
@@ -90,7 +115,7 @@ func (l *Lock) Lock() error {
 		}
 
 		lowestSeq := seq
-		prevSeq := 0
+		prevSeq := -1
 		prevSeqPath := ""
 		for _, p := range children {
 			s, err := parseSeq(p)
@@ -125,10 +150,14 @@ func (l *Lock) Lock() error {
 			return ev.Err
 		}
 	}
+
 	l.seq = seq
 	l.lockPath = path
 	return nil
 }
+
+// LockWC acquires the lock like LockW and additionally releases it once a
+// value is received from (or close of) c.
 func (l *Lock) LockWC(c <-chan bool) (watch <-chan bool, err error) {
 	watch, err = l.LockW()
 	if err != nil {
@@ -140,36 +169,35 @@ func (l *Lock) LockWC(c <-chan bool) (watch <-chan bool, err error) {
 	}()
 	return
 }
+
+// LockW acquires the lock and returns a channel that receives false once the
+// session is lost or the lock node disappears; the lock is then released.
 func (l *Lock) LockW() (watch <-chan bool, err error) {
-	err = l.Lock()
-	if err != nil {
+	if err = l.Lock(); err != nil {
 		return
 	}
+	lockPath := l.lockPath
 	chev := make(chan bool)
 	watch = chev
-	var ok bool
 	go func() {
 		for {
-
 			if l.c.State() != StateHasSession {
-				chev <- false
-				time.Sleep(time.Millisecond * 200)
-				l.Unlock()
 				break
-
-			} else if ok, _, err = l.c.Exists(l.lockPath); err != nil || !ok {
-				chev <- false
-				time.Sleep(time.Millisecond * 200)
-				l.Unlock()
+			}
+			if ok, _, err := l.c.Exists(lockPath); err != nil || !ok {
 				break
-
 			}
 			time.Sleep(time.Millisecond * 500)
 		}
-
+		chev <- false
+		time.Sleep(time.Millisecond * 200)
+		l.Unlock()
 	}()
 	return
 }
+
+// Unlock releases an acquired lock. If the lock is not currently acquired by
+// this Lock instance than ErrNotLocked is returned.
 func (l *Lock) Unlock() error {
 	if l.lockPath == "" {
 		return ErrNotLocked
@@ -177,7 +205,7 @@ func (l *Lock) Unlock() error {
 	if err := l.c.Delete(l.lockPath, -1); err != nil {
 		return err
 	}
-	//	l.lockPath = ""
+	l.lockPath = ""
 	l.seq = 0
 	return nil
 }
